@@ -708,6 +708,29 @@ func IfByFlag(inputFlags string, ifAddrs IfAddrs) (matched, remainder IfAddrs, e
 	return matchedAddrs, excludedAddrs, nil
 }
 
+// IfWithoutLoopback returns two lists of IfAddrs: the first contains IfAddrs
+// that are neither loopback addresses nor attached to a loopback interface,
+// the second contains the IfAddrs that were excluded.  Addresses attached to
+// a loopback interface are excluded even when the address itself is not a
+// loopback address (e.g. an alias on "lo") because peers on other hosts can't
+// reach them.
+func IfWithoutLoopback(ifAddrs IfAddrs) (matched, remainder IfAddrs) {
+	matchedAddrs := make(IfAddrs, 0, len(ifAddrs))
+	excludedAddrs := make(IfAddrs, 0, len(ifAddrs))
+	for _, ifAddr := range ifAddrs {
+		if ifAddr.Flags&net.FlagLoopback != 0 {
+			excludedAddrs = append(excludedAddrs, ifAddr)
+			continue
+		}
+		if ip := ToIPAddr(ifAddr.SockAddr); ip != nil && (*ip).NetIP().IsLoopback() {
+			excludedAddrs = append(excludedAddrs, ifAddr)
+			continue
+		}
+		matchedAddrs = append(matchedAddrs, ifAddr)
+	}
+	return matchedAddrs, excludedAddrs
+}
+
 // IfByNetwork returns an IfAddrs that are equal to or included within the
 // network passed in by selector.
 func IfByNetwork(selectorParam string, inputIfAddrs IfAddrs) (IfAddrs, IfAddrs, error) {

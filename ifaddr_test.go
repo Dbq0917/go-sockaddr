@@ -131,6 +131,73 @@ func TestGetInterfaceIP(t *testing.T) {
 	}
 }
 
+func TestGetInterfaceIPSkipsLoopback(t *testing.T) {
+	ip, err := sockaddr.GetInterfaceIP(`^.*$`)
+	if err != nil {
+		t.Fatalf("unable to get an interface IP: %v", err)
+	}
+
+	if ip == "" {
+		t.Skip("no usable interface on this host")
+	}
+
+	if parsed := net.ParseIP(ip); parsed == nil || parsed.IsLoopback() {
+		t.Fatalf("expected a non-loopback IP, got %q", ip)
+	}
+}
+
+func TestGetInterfaceIPsSkipsLoopback(t *testing.T) {
+	ips, err := sockaddr.GetInterfaceIPs(`^.*$`)
+	if err != nil {
+		t.Fatalf("unable to get interface IPs: %v", err)
+	}
+
+	if ips == "" {
+		t.Skip("no usable interface on this host")
+	}
+
+	for _, s := range strings.Fields(ips) {
+		if parsed := net.ParseIP(s); parsed == nil || parsed.IsLoopback() {
+			t.Fatalf("expected no loopback IPs in %q", ips)
+		}
+	}
+}
+
+func TestGetInterfaceIPsAllowLoopback(t *testing.T) {
+	// Every host is expected to have a loopback address; explicitly opting
+	// in with AllowLoopback must return it.
+	ifAddrs, err := sockaddr.GetAllInterfaces()
+	if err != nil {
+		t.Fatalf("unable to get interfaces: %v", err)
+	}
+	var haveLoopback bool
+	for _, ifAddr := range ifAddrs {
+		if ip := sockaddr.ToIPAddr(ifAddr.SockAddr); ip != nil && (*ip).NetIP().IsLoopback() {
+			haveLoopback = true
+			break
+		}
+	}
+	if !haveLoopback {
+		t.Skip("no loopback address on this host")
+	}
+
+	ips, err := sockaddr.GetInterfaceIPs(`^.*$`, sockaddr.AllowLoopback())
+	if err != nil {
+		t.Fatalf("unable to get interface IPs: %v", err)
+	}
+
+	var found bool
+	for _, s := range strings.Fields(ips) {
+		if parsed := net.ParseIP(s); parsed != nil && parsed.IsLoopback() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loopback IP in %q with AllowLoopback", ips)
+	}
+}
+
 func TestIfAddrAttr(t *testing.T) {
 	tests := []struct {
 		name     string

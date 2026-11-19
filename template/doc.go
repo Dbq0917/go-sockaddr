@@ -105,8 +105,10 @@ Example:
     {{ GetPrivateIPs }}
 
 
-`GetInterfaceIP` - Helper function that returns a string of the first IP from
-the named interface.
+`GetInterfaceIP` - Helper function that returns a string of the first usable
+IP from the named interface.  Loopback addresses and addresses on interfaces
+that are down are excluded; candidates are ordered with the default route
+first.
 
 Example:
 
@@ -115,11 +117,22 @@ Example:
 
 
 `GetInterfaceIPs` - Helper function that returns a space-delimited list of all
-IPs on a given interface.
+usable IPs on a given interface.  Loopback addresses and addresses on
+interfaces that are down are excluded; candidates are ordered with the
+default route first.
 
 Example:
 
     {{ GetInterfaceIPs "en0" }}
+
+
+`AllowLoopback` - Helper option that explicitly allows loopback addresses to
+be returned by `GetInterfaceIP` and `GetInterfaceIPs` for special scenarios
+(e.g. single-node testing).  Loopback candidates are excluded by default.
+
+Example:
+
+    {{ GetInterfaceIPs "lo" AllowLoopback }}
 
 
 `sort` - Sorts the IfAddrs result based on its arguments.  `sort` takes one

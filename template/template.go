@@ -93,13 +93,23 @@ func init() {
 		// default route.
 		"GetPublicIPs": sockaddr.GetPublicIPs,
 
-		// Return the first IP address of the named interface, sorted by
-		// the largest network size.
+		// Return the first usable IP address of the named interface,
+		// ordered with the default route first.  Loopback addresses and
+		// addresses on interfaces that are down are excluded.
 		"GetInterfaceIP": sockaddr.GetInterfaceIP,
 
-		// Return all IP addresses on the named interface, sorted by the largest
-		// network size.
+		// Return all usable IP addresses on the named interface, ordered
+		// with the default route first.  Loopback addresses and addresses
+		// on interfaces that are down are excluded.
 		"GetInterfaceIPs": sockaddr.GetInterfaceIPs,
+
+		// Explicitly allow loopback candidates in GetInterfaceIP and
+		// GetInterfaceIPs.  Loopback addresses are excluded by default.
+		//
+		// Example:
+		//
+		//   {{ GetInterfaceIPs "lo" AllowLoopback }}
+		"AllowLoopback": sockaddr.AllowLoopback,
 	}
 }
 

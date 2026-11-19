@@ -407,6 +407,59 @@ func TestFilterIfByFlags(t *testing.T) {
 	}
 }
 
+func TestIfWithoutLoopback(t *testing.T) {
+	// Simulate a multi-homed host where the loopback interface carries both
+	// a loopback address and a non-loopback alias, as seen in containers.
+	loopbackAddr := sockaddr.IfAddr{
+		Interface: net.Interface{
+			Name:  "lo",
+			Flags: net.FlagUp | net.FlagLoopback,
+		},
+		SockAddr: sockaddr.MustIPv4Addr("127.0.0.1/8"),
+	}
+	loopbackAlias := sockaddr.IfAddr{
+		Interface: net.Interface{
+			Name:  "lo",
+			Flags: net.FlagUp | net.FlagLoopback,
+		},
+		SockAddr: sockaddr.MustIPv4Addr("10.255.255.254/32"),
+	}
+	loopbackV6 := sockaddr.IfAddr{
+		Interface: net.Interface{
+			Name:  "lo",
+			Flags: net.FlagUp | net.FlagLoopback,
+		},
+		SockAddr: sockaddr.MustIPv6Addr("::1/128"),
+	}
+	eth0Addr := sockaddr.IfAddr{
+		Interface: net.Interface{
+			Name:  "eth0",
+			Flags: net.FlagUp | net.FlagBroadcast,
+		},
+		SockAddr: sockaddr.MustIPv4Addr("172.16.0.10/24"),
+	}
+	eth1Addr := sockaddr.IfAddr{
+		Interface: net.Interface{
+			Name:  "eth1",
+			Flags: net.FlagUp | net.FlagBroadcast,
+		},
+		SockAddr: sockaddr.MustIPv4Addr("192.168.1.10/24"),
+	}
+
+	in := sockaddr.IfAddrs{loopbackAddr, eth0Addr, loopbackAlias, eth1Addr, loopbackV6}
+	matched, remainder := sockaddr.IfWithoutLoopback(in)
+
+	expectedMatched := sockaddr.IfAddrs{eth0Addr, eth1Addr}
+	if !reflect.DeepEqual(matched, expectedMatched) {
+		t.Fatalf("expected matched %v, got %v", expectedMatched, matched)
+	}
+
+	expectedRemainder := sockaddr.IfAddrs{loopbackAddr, loopbackAlias, loopbackV6}
+	if !reflect.DeepEqual(remainder, expectedRemainder) {
+		t.Fatalf("expected remainder %v, got %v", expectedRemainder, remainder)
+	}
+}
+
 func TestIfByNetwork(t *testing.T) {
 	tests := []struct {
 		name     string
