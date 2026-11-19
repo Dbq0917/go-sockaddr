@@ -38,7 +38,7 @@ func (ri routeInfo) GetDefaultInterfaceName() (string, error) {
 // Android.
 func parseDefaultIfNameFromIPCmdAndroid(routeOut string) (string, error) {
 	parsedLines := parseIfNameFromIPCmd(routeOut)
-	if len(parsedLines) > 0 {
+	if len(parsedLines) > 0 && len(parsedLines[0]) > 4 {
 		ifName := strings.TrimSpace(parsedLines[0][4])
 		return ifName, nil
 	}

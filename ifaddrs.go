@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 var (
@@ -24,7 +26,22 @@ var (
 	// and should be removed when those functions are.
 	ifNameRE *regexp.Regexp = regexp.MustCompile(`^(?:Ethernet|Wireless LAN) adapter ([^:]+):`)
 	ipAddrRE *regexp.Regexp = regexp.MustCompile(`^   IPv[46] Address\. \. \. \. \. \. \. \. \. \. \. : ([^\s]+)`)
+
+	interfaceCacheMu      sync.Mutex
+	interfaceCache        IfAddrs
+	interfaceCacheExpires time.Time
+	interfaceCacheValid   bool
+
+	// enumerateInterfaces is replaceable so cache behavior can be tested
+	// without depending on the host's current network configuration.
+	enumerateInterfaces = getAllInterfaces
+
+	// defaultIfNameFunc is replaceable so address-selection behavior can be
+	// tested without depending on the host's current route table.
+	defaultIfNameFunc = getDefaultIfNameFromRoute
 )
+
+const interfaceCacheTTL = 5 * time.Second
 
 // IfAddrs is a slice of IfAddr
 type IfAddrs []IfAddr
@@ -128,16 +145,40 @@ func AscIfDefault(p1Ptr, p2Ptr *IfAddr) int {
 		return sortDeferDecision
 	}
 
-	switch {
-	case p1Ptr.Name == defaultIfName && p2Ptr.Name == defaultIfName:
-		return sortDeferDecision
-	case p1Ptr.Name == defaultIfName:
-		return sortReceiverBeforeArg
-	case p2Ptr.Name == defaultIfName:
-		return sortArgBeforeReceiver
-	default:
-		return sortDeferDecision
+	return ascIfDefault(defaultIfName)(p1Ptr, p2Ptr)
+}
+
+func ascIfDefault(defaultIfName string) CmpIfAddrFunc {
+	return func(p1Ptr, p2Ptr *IfAddr) int {
+		switch {
+		case p1Ptr.Name == defaultIfName && p2Ptr.Name == defaultIfName:
+			return sortDeferDecision
+		case p1Ptr.Name == defaultIfName:
+			return sortReceiverBeforeArg
+		case p2Ptr.Name == defaultIfName:
+			return sortArgBeforeReceiver
+		default:
+			return sortDeferDecision
+		}
 	}
+}
+
+func defaultInterfaceName() string {
+	defaultIfName, err := defaultIfNameFunc()
+	if err != nil {
+		return ""
+	}
+
+	return defaultIfName
+}
+
+func getDefaultIfNameFromRoute() (string, error) {
+	ri, err := NewRouteInfo()
+	if err != nil {
+		return "", err
+	}
+
+	return ri.GetDefaultInterfaceName()
 }
 
 // AscIfName is a sorting function to sort IfAddrs by their interface names.
@@ -241,10 +282,65 @@ func IfAttrs(selectorName string, ifAddrs IfAddrs) (string, error) {
 	return attrVal, err
 }
 
-// GetAllInterfaces iterates over all available network interfaces and finds all
-// available IP addresses on each interface and converts them to
-// sockaddr.IPAddrs, and returning the result as an array of IfAddr.
+// GetAllInterfaces returns all available network interfaces and their IP
+// addresses.  Results are cached briefly because collecting interface
+// addresses requires a full enumeration and can be expensive on hosts with
+// many interfaces.  Use InvalidateInterfaceCache to force the next call to
+// refresh the cache.
 func GetAllInterfaces() (IfAddrs, error) {
+	ifAddrs, _, err := getAllInterfacesCached()
+	return ifAddrs, err
+}
+
+// InvalidateInterfaceCache discards the cached interface snapshot.  The next
+// call to GetAllInterfaces will enumerate the interfaces again.
+func InvalidateInterfaceCache() {
+	interfaceCacheMu.Lock()
+	defer interfaceCacheMu.Unlock()
+
+	interfaceCache = nil
+	interfaceCacheExpires = time.Time{}
+	interfaceCacheValid = false
+}
+
+// getAllInterfacesCached returns a snapshot and whether it came from the
+// cache.  Callers that select addresses must validate cached candidates
+// before returning them because the host's network configuration may have
+// changed since the snapshot was taken.
+func getAllInterfacesCached() (IfAddrs, bool, error) {
+	now := time.Now()
+
+	interfaceCacheMu.Lock()
+	defer interfaceCacheMu.Unlock()
+
+	if interfaceCacheValid && now.Before(interfaceCacheExpires) {
+		return cloneIfAddrs(interfaceCache), true, nil
+	}
+
+	ifAddrs, err := enumerateInterfaces()
+	if err != nil {
+		return nil, false, err
+	}
+
+	interfaceCache = cloneIfAddrs(ifAddrs)
+	interfaceCacheExpires = now.Add(interfaceCacheTTL)
+	interfaceCacheValid = true
+
+	return cloneIfAddrs(ifAddrs), false, nil
+}
+
+func cloneIfAddrs(ifAddrs IfAddrs) IfAddrs {
+	cloned := make(IfAddrs, len(ifAddrs))
+	for i, ifAddr := range ifAddrs {
+		cloned[i] = ifAddr
+		if len(ifAddr.HardwareAddr) > 0 {
+			cloned[i].HardwareAddr = append(net.HardwareAddr(nil), ifAddr.HardwareAddr...)
+		}
+	}
+	return cloned
+}
+
+func getAllInterfaces() (IfAddrs, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -278,20 +374,35 @@ func GetAllInterfaces() (IfAddrs, error) {
 // GetDefaultInterfaces returns IfAddrs of the addresses attached to the default
 // route.
 func GetDefaultInterfaces() (IfAddrs, error) {
-	ri, err := NewRouteInfo()
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < 2; attempt++ {
+		defaultIfs, cached, err := getDefaultInterfacesCached()
+		if err != nil {
+			return IfAddrs{}, err
+		}
+
+		if !cached {
+			return defaultIfs, nil
+		}
+		if len(defaultIfs) > 0 && cachedIfAddrsStillUsable(defaultIfs) {
+			return defaultIfs, nil
+		}
+
+		InvalidateInterfaceCache()
 	}
 
-	defaultIfName, err := ri.GetDefaultInterfaceName()
+	return IfAddrs{}, nil
+}
+
+func getDefaultInterfacesCached() (IfAddrs, bool, error) {
+	defaultIfName, err := defaultIfNameFunc()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	var defaultIfs, ifAddrs IfAddrs
-	ifAddrs, err = GetAllInterfaces()
+	var defaultIfs IfAddrs
+	ifAddrs, cached, err := getAllInterfacesCached()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	for _, ifAddr := range ifAddrs {
@@ -300,7 +411,7 @@ func GetDefaultInterfaces() (IfAddrs, error) {
 		}
 	}
 
-	return defaultIfs, nil
+	return defaultIfs, cached, nil
 }
 
 // GetPrivateInterfaces returns an IfAddrs that are part of RFC 6890 and have a
@@ -312,43 +423,8 @@ func GetDefaultInterfaces() (IfAddrs, error) {
 // $ sockaddr eval -r '{{GetAllInterfaces | include "type" "ip" | include "flags" "forwardable" | include "flags" "up" | sort "default,type,size" | include "RFC" "6890" }}'
 // ```
 func GetPrivateInterfaces() (IfAddrs, error) {
-	privateIfs, err := GetAllInterfaces()
-	if err != nil {
-		return IfAddrs{}, err
-	}
-	if len(privateIfs) == 0 {
-		return IfAddrs{}, nil
-	}
-
-	privateIfs, _ = FilterIfByType(privateIfs, TypeIP)
-	if len(privateIfs) == 0 {
-		return IfAddrs{}, nil
-	}
-
-	privateIfs, _, err = IfByFlag("forwardable", privateIfs)
-	if err != nil {
-		return IfAddrs{}, err
-	}
-
-	privateIfs, _, err = IfByFlag("up", privateIfs)
-	if err != nil {
-		return IfAddrs{}, err
-	}
-
-	if len(privateIfs) == 0 {
-		return IfAddrs{}, nil
-	}
-
-	OrderedIfAddrBy(AscIfDefault, AscIfType, AscIfNetworkSize).Sort(privateIfs)
-
-	privateIfs, _, err = IfByRFC("6890", privateIfs)
-	if err != nil {
-		return IfAddrs{}, err
-	} else if len(privateIfs) == 0 {
-		return IfAddrs{}, nil
-	}
-
-	return privateIfs, nil
+	privateIfs, _, err := getPrivateInterfacesCached()
+	return privateIfs, err
 }
 
 // GetPublicInterfaces returns an IfAddrs that are NOT part of RFC 6890 and has a
@@ -360,43 +436,156 @@ func GetPrivateInterfaces() (IfAddrs, error) {
 // $ sockaddr eval -r '{{GetAllInterfaces | include "type" "ip" | include "flags" "forwardable" | include "flags" "up" | sort "default,type,size" | exclude "RFC" "6890" }}'
 // ```
 func GetPublicInterfaces() (IfAddrs, error) {
-	publicIfs, err := GetAllInterfaces()
+	publicIfs, _, err := getPublicInterfacesCached()
+	return publicIfs, err
+}
+
+func getPrivateInterfacesCached() (IfAddrs, bool, error) {
+	ifAddrs, cached, err := getInterfacesCached(func(all IfAddrs) (IfAddrs, error) {
+		return privateInterfacesFrom(all, defaultInterfaceName())
+	})
+	return ifAddrs, cached, err
+}
+
+func getPublicInterfacesCached() (IfAddrs, bool, error) {
+	ifAddrs, cached, err := getInterfacesCached(func(all IfAddrs) (IfAddrs, error) {
+		return publicInterfacesFrom(all, defaultInterfaceName())
+	})
+	return ifAddrs, cached, err
+}
+
+func getInterfacesCached(filter func(IfAddrs) (IfAddrs, error)) (IfAddrs, bool, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		allIfAddrs, cached, err := getAllInterfacesCached()
+		if err != nil {
+			return IfAddrs{}, false, err
+		}
+
+		filtered, err := filter(allIfAddrs)
+		if err != nil {
+			return IfAddrs{}, false, err
+		}
+
+		if !cached {
+			return filtered, false, nil
+		}
+
+		if len(filtered) > 0 && cachedIfAddrsStillUsable(filtered) {
+			return filtered, true, nil
+		}
+
+		// The cached snapshot no longer reflects the host.  Refresh it and
+		// make one more attempt using the fresh data.
+		InvalidateInterfaceCache()
+	}
+
+	return IfAddrs{}, false, nil
+}
+
+func privateInterfacesFrom(ifAddrs IfAddrs, defaultIfName string) (IfAddrs, error) {
+	privateIfs, err := selectableInterfaces(ifAddrs)
+	if err != nil || len(privateIfs) == 0 {
+		return IfAddrs{}, err
+	}
+
+	sortIfAddrsByDefault(privateIfs, defaultIfName)
+
+	privateIfs, _, err = IfByRFC("6890", privateIfs)
 	if err != nil {
 		return IfAddrs{}, err
 	}
-	if len(publicIfs) == 0 {
-		return IfAddrs{}, nil
-	}
 
-	publicIfs, _ = FilterIfByType(publicIfs, TypeIP)
-	if len(publicIfs) == 0 {
-		return IfAddrs{}, nil
-	}
+	return privateIfs, nil
+}
 
-	publicIfs, _, err = IfByFlag("forwardable", publicIfs)
-	if err != nil {
+func publicInterfacesFrom(ifAddrs IfAddrs, defaultIfName string) (IfAddrs, error) {
+	publicIfs, err := selectableInterfaces(ifAddrs)
+	if err != nil || len(publicIfs) == 0 {
 		return IfAddrs{}, err
 	}
 
-	publicIfs, _, err = IfByFlag("up", publicIfs)
-	if err != nil {
-		return IfAddrs{}, err
-	}
-
-	if len(publicIfs) == 0 {
-		return IfAddrs{}, nil
-	}
-
-	OrderedIfAddrBy(AscIfDefault, AscIfType, AscIfNetworkSize).Sort(publicIfs)
+	sortIfAddrsByDefault(publicIfs, defaultIfName)
 
 	_, publicIfs, err = IfByRFC("6890", publicIfs)
 	if err != nil {
 		return IfAddrs{}, err
-	} else if len(publicIfs) == 0 {
-		return IfAddrs{}, nil
 	}
 
 	return publicIfs, nil
+}
+
+func selectableInterfaces(ifAddrs IfAddrs) (IfAddrs, error) {
+	ifAddrs, _ = FilterIfByType(ifAddrs, TypeIP)
+	if len(ifAddrs) == 0 {
+		return IfAddrs{}, nil
+	}
+
+	ifAddrs, _, err := IfByFlag("up|forwardable", ifAddrs)
+	if err != nil || len(ifAddrs) == 0 {
+		return IfAddrs{}, err
+	}
+
+	_, ifAddrs, err = IfByFlag("loopback", ifAddrs)
+	if err != nil {
+		return IfAddrs{}, err
+	}
+
+	return ifAddrs, nil
+}
+
+func sortIfAddrsByDefault(ifAddrs IfAddrs, defaultIfName string) {
+	comparators := []CmpIfAddrFunc{AscIfType, AscIfNetworkSize}
+	if defaultIfName != "" {
+		comparators = append([]CmpIfAddrFunc{ascIfDefault(defaultIfName)}, comparators...)
+	}
+	OrderedIfAddrBy(comparators...).Sort(ifAddrs)
+}
+
+func cachedIfAddrsStillUsable(ifAddrs IfAddrs) bool {
+	if len(ifAddrs) == 0 {
+		return false
+	}
+
+	for _, ifAddr := range ifAddrs {
+		if !ifAddrIsCurrentlyUsable(ifAddr) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func ifAddrIsCurrentlyUsable(ifAddr IfAddr) bool {
+	if ifAddr.Name == "" || !interfaceIsUsable(ifAddr.Name) {
+		return false
+	}
+
+	ipAddr := ToIPAddr(ifAddr.SockAddr)
+	if ipAddr == nil {
+		return false
+	}
+
+	netIP := *(*ipAddr).NetIP()
+	if netIP == nil || netIP.IsUnspecified() || netIP.IsMulticast() || netIP.IsLoopback() {
+		return false
+	}
+
+	network := "udp4"
+	udpAddr := &net.UDPAddr{IP: netIP}
+	if netIP.To4() == nil {
+		network = "udp6"
+		if netIP.IsLinkLocalUnicast() {
+			udpAddr.Zone = ifAddr.Name
+		}
+	}
+
+	conn, err := net.ListenUDP(network, udpAddr)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+
+	return true
 }
 
 // IfByAddress returns a list of matched and non-matched IfAddrs, or an error if
@@ -614,7 +803,11 @@ func IfByFlag(inputFlags string, ifAddrs IfAddrs) (matched, remainder IfAddrs, e
 	matchedAddrs := make(IfAddrs, 0, len(ifAddrs))
 	excludedAddrs := make(IfAddrs, 0, len(ifAddrs))
 
-	var wantForwardable,
+	var (
+		requireFlags net.Flags
+		wantDown     bool
+
+		wantForwardable,
 		wantGlobalUnicast,
 		wantInterfaceLocalMulticast,
 		wantLinkLocalMulticast,
@@ -622,83 +815,76 @@ func IfByFlag(inputFlags string, ifAddrs IfAddrs) (matched, remainder IfAddrs, e
 		wantLoopback,
 		wantMulticast,
 		wantUnspecified bool
-	var ifFlags net.Flags
-	var checkFlags, checkAttrs bool
+	)
 	for flagName := range strings.SplitSeq(strings.ToLower(inputFlags), "|") {
 		switch flagName {
 		case "broadcast":
-			checkFlags = true
-			ifFlags = ifFlags | net.FlagBroadcast
+			requireFlags |= net.FlagBroadcast
 		case "down":
-			checkFlags = true
-			ifFlags = (ifFlags &^ net.FlagUp)
+			wantDown = true
 		case "forwardable":
-			checkAttrs = true
 			wantForwardable = true
 		case "global unicast":
-			checkAttrs = true
 			wantGlobalUnicast = true
 		case "interface-local multicast":
-			checkAttrs = true
 			wantInterfaceLocalMulticast = true
 		case "link-local multicast":
-			checkAttrs = true
 			wantLinkLocalMulticast = true
 		case "link-local unicast":
-			checkAttrs = true
 			wantLinkLocalUnicast = true
 		case "loopback":
-			checkAttrs = true
-			checkFlags = true
-			ifFlags = ifFlags | net.FlagLoopback
 			wantLoopback = true
 		case "multicast":
-			checkAttrs = true
-			checkFlags = true
-			ifFlags = ifFlags | net.FlagMulticast
 			wantMulticast = true
 		case "point-to-point":
-			checkFlags = true
-			ifFlags = ifFlags | net.FlagPointToPoint
+			requireFlags |= net.FlagPointToPoint
 		case "unspecified":
-			checkAttrs = true
 			wantUnspecified = true
 		case "up":
-			checkFlags = true
-			ifFlags = ifFlags | net.FlagUp
+			requireFlags |= net.FlagUp
 		default:
 			return nil, nil, fmt.Errorf("unknown interface flag: %+q", flagName)
 		}
 	}
 
 	for _, ifAddr := range ifAddrs {
-		var matched bool
-		if checkFlags && ifAddr.Flags&ifFlags == ifFlags {
-			matched = true
+		matched := ifAddr.Flags&requireFlags == requireFlags
+		if wantDown {
+			matched = matched && ifAddr.Flags&net.FlagUp == 0
 		}
-		if checkAttrs {
-			if ip := ToIPAddr(ifAddr.SockAddr); ip != nil {
-				netIP := (*ip).NetIP()
-				switch {
-				case wantGlobalUnicast && netIP.IsGlobalUnicast():
-					matched = true
-				case wantInterfaceLocalMulticast && netIP.IsInterfaceLocalMulticast():
-					matched = true
-				case wantLinkLocalMulticast && netIP.IsLinkLocalMulticast():
-					matched = true
-				case wantLinkLocalUnicast && netIP.IsLinkLocalUnicast():
-					matched = true
-				case wantLoopback && netIP.IsLoopback():
-					matched = true
-				case wantMulticast && netIP.IsMulticast():
-					matched = true
-				case wantUnspecified && netIP.IsUnspecified():
-					matched = true
-				case wantForwardable && !IsRFC(ForwardingBlacklist, ifAddr.SockAddr):
-					matched = true
-				}
-			}
+
+		var netIP net.IP
+		if ip := ToIPAddr(ifAddr.SockAddr); ip != nil {
+			netIP = *(*ip).NetIP()
 		}
+
+		if wantGlobalUnicast {
+			matched = matched && netIP != nil && netIP.IsGlobalUnicast()
+		}
+		if wantInterfaceLocalMulticast {
+			matched = matched && netIP != nil && netIP.IsInterfaceLocalMulticast()
+		}
+		if wantLinkLocalMulticast {
+			matched = matched && netIP != nil && netIP.IsLinkLocalMulticast()
+		}
+		if wantLinkLocalUnicast {
+			matched = matched && netIP != nil && netIP.IsLinkLocalUnicast()
+		}
+		if wantUnspecified {
+			matched = matched && netIP != nil && netIP.IsUnspecified()
+		}
+		if wantForwardable {
+			matched = matched && !IsRFC(ForwardingBlacklist, ifAddr.SockAddr)
+		}
+		if wantLoopback {
+			matched = matched &&
+				(ifAddr.Flags&net.FlagLoopback != 0 || (netIP != nil && netIP.IsLoopback()))
+		}
+		if wantMulticast {
+			matched = matched &&
+				(ifAddr.Flags&net.FlagMulticast != 0 || (netIP != nil && netIP.IsMulticast()))
+		}
+
 		if matched {
 			matchedAddrs = append(matchedAddrs, ifAddr)
 		} else {
@@ -1199,13 +1385,32 @@ func parseDefaultIfNameFromRoute(routeOut string) (string, error) {
 // parseDefaultIfNameFromIPCmd parses the default interface from ip(8) for
 // Linux.
 func parseDefaultIfNameFromIPCmd(routeOut string) (string, error) {
-	parsedLines := parseIfNameFromIPCmd(routeOut)
-	for _, parsedLine := range parsedLines {
-		if parsedLine[0] == "default" &&
-			parsedLine[1] == "via" &&
-			parsedLine[3] == "dev" {
-			ifName := strings.TrimSpace(parsedLine[4])
-			return ifName, nil
+	inDefaultRoute := false
+	for _, line := range strings.Split(routeOut, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		if fields[0] == "default" {
+			inDefaultRoute = true
+		} else if inDefaultRoute {
+			if len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+				inDefaultRoute = false
+			}
+		}
+
+		if !inDefaultRoute {
+			continue
+		}
+
+		// Linux supports both gateway routes ("default via ... dev eth0")
+		// and direct routes ("default dev eth0").  ECMP routes put the
+		// interfaces on subsequent nexthop lines.
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "dev" {
+				return strings.TrimSpace(fields[i+1]), nil
+			}
 		}
 	}
 
@@ -1219,7 +1424,7 @@ func parseIfNameFromIPCmd(routeOut string) [][]string {
 	parsedLines := make([][]string, 0, len(lines))
 	for _, line := range lines {
 		kvs := whitespaceRE.Split(line, -1)
-		if len(kvs) < 5 {
+		if len(kvs) < 2 {
 			continue
 		}
 		parsedLines = append(parsedLines, kvs)

@@ -76,6 +76,53 @@ func Test_parseLinuxDefaultIfName(t *testing.T) {
 	}
 }
 
+func Test_parseLinuxDefaultIfNameRoutes(t *testing.T) {
+	testCases := []struct {
+		name     string
+		routeOut string
+		want     string
+	}{
+		{
+			name: "direct route",
+			routeOut: `default dev eth0 scope link
+`,
+			want: "eth0",
+		},
+		{
+			name: "ECMP route",
+			routeOut: `default
+	nexthop via 223.110.247.129 dev bond0 weight 1
+	nexthop via 223.110.247.129 dev bond1 weight 1
+`,
+			want: "bond0",
+		},
+		{
+			name: "no default route",
+			routeOut: `10.1.2.0/24 dev eth0 proto kernel scope link src 10.1.2.5
+`,
+			want: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseDefaultIfNameFromIPCmd(tc.routeOut)
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("expected an error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unable to parse default interface: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func Test_parseWindowsDefaultIfName(t *testing.T) {
 	testCases := []struct {
 		name        string
