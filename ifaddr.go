@@ -232,7 +232,8 @@ func IfAddrAttrs() []AttrName {
 func IfAddrAttr(ifAddr IfAddr, attrName AttrName) string {
 	fn, found := ifAddrAttrMap[attrName]
 	if !found {
-		return ""
+		val, _ := Attr(ifAddr.SockAddr, attrName)
+		return val
 	}
 
 	return fn(ifAddr)

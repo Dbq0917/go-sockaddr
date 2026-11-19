@@ -53,6 +53,15 @@ IP address on the default interface, respectively.  Similarly, there is also a
 helper function called `GetInterfaceIP` which returns the first usable IP
 address on the named interface.
 
+There is also a `GetUsableIP` helper (and its `GetUsableInterfaces` sibling)
+which ranks every candidate address — default route first, virtual/bridge
+interfaces such as `docker0` last, loopback/down/link-local excluded — and
+returns the best address to bind to.  The interface list behind these helpers
+is cached and self-validating: address additions and removals are reflected
+by the next call without paying for a full enumeration every time, and
+`InvalidateInterfaceCache` forces a refresh for callers that learn about
+address changes out of band.
+
 ## `sockaddr` CLI
 
 Given the possible complexity of the `sockaddr` library, there is a CLI utility

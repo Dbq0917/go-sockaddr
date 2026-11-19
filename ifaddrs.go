@@ -244,7 +244,21 @@ func IfAttrs(selectorName string, ifAddrs IfAddrs) (string, error) {
 // GetAllInterfaces iterates over all available network interfaces and finds all
 // available IP addresses on each interface and converts them to
 // sockaddr.IPAddrs, and returning the result as an array of IfAddr.
+//
+// The result is cached: repeated calls are served from the package-level
+// InterfaceCache as long as the cheap change detection (interface list and
+// per-address ownership) shows no changes.  An address that is added to or
+// removed from the host is reflected by the next call.  Call
+// InvalidateInterfaceCache to force a re-enumeration.
 func GetAllInterfaces() (IfAddrs, error) {
+	return defaultInterfaceCache.GetAllInterfaces()
+}
+
+// enumInterfaces performs a full enumeration of every address on every
+// interface of the host.  It is the expensive operation behind
+// GetAllInterfaces and should not be called on hot paths; use
+// GetAllInterfaces instead.
+func enumInterfaces() (IfAddrs, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
